@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: convai-mp3-server
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    autoDeploy: true
+    envVars:
+      - key: CONVAI_API_KEY
+        sync: false
+      - key: CHARACTER_ID
+        sync: false
+    healthCheckPath: /health
