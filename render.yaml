@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: convai-mp3-server
+    name: convai-wav-server
     env: node
     plan: free
     buildCommand: "npm install"
