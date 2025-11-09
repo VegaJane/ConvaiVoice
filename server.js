@@ -1,144 +1,123 @@
-// server.js — Render service for SL + Discord (keeps SL working, adds /discordSay)
-
 import express from "express";
+import bodyParser from "body-parser";
 import fs from "fs";
 import path from "path";
 import axios from "axios";
-import { fileURLToPath } from "url";
-
-// ESM __dirname
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import FormData from "form-data";
 
 const app = express();
+app.use(bodyParser.json({ limit: "50mb" }));
 
-// Body parsing
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
-
-// Public dir and output file (SL expects MP3 path; we keep that)
-const PUBLIC_DIR = path.join(__dirname, "public");
+// Ensure public directory exists
+const PUBLIC_DIR = path.join(process.cwd(), "public");
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
-const OUTPUT_MP3 = path.join(PUBLIC_DIR, "output.mp3");
 
-// Health
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+const AUDIO_FILE = path.join(PUBLIC_DIR, "output.wav");
 
-// Static (serves /output.mp3 if it exists)
-app.use(express.static(PUBLIC_DIR));
+// Health check
+app.get("/health", (_req, res) => res.send("ok"));
 
-/* -------------------------------
-   KEEP YOUR EXISTING SL ENDPOINT
-   -------------------------------
-   POST /updateText
-   Accepts:
-     A) { base64: "<audio_base64>" }  -> saves output.mp3 (this is what your SL HUD uses)
-     B) { text: "hello" }             -> optional helper; will try Convai then save output.mp3
-*/
+/**
+ * POST /updateText
+ * Body options:
+ *   A) { text: "hello" }  -> server calls Convai with voiceResponse=true and saves output.wav
+ *   B) { base64: "<audio_base64>" } -> directly saves output.wav
+ *
+ * Response: { success: true, text: "<convai_text_or_null>", url: "/output.wav" }
+ */
 app.post("/updateText", async (req, res) => {
   try {
-    let { text, base64 } = req.body || {};
+    const { text, base64 } = req.body || {};
+
     let convaiText = null;
-
-    if (!text && !base64) {
-      return res.status(400).json({ error: "Missing 'text' or 'base64'." });
-    }
-
-    // If SL sends the audio directly, just save it
-    if (base64) {
-      fs.writeFileSync(OUTPUT_MP3, Buffer.from(base64, "base64"));
-      return res.json({ success: true, text: null, url: "/output.mp3" });
-    }
-
-    // If text is provided, try Convai (kept for compatibility)
-    const apiKey = process.env.CONVAI_API_KEY;
-    const charId = process.env.CONVAI_CHAR_ID || process.env.CHARACTER_ID;
-    if (!apiKey || !charId) {
-      return res.status(500).json({ error: "Missing CONVAI_API_KEY or CONVAI_CHAR_ID/CHARACTER_ID." });
-    }
-
-    // JSON first
-    let audioBase64 = null;
-    try {
-      const r = await axios.post(
-        "https://api.convai.com/character/getResponse",
-        { userText: text, charID: charId, sessionID: "-1", voiceResponse: true },
-        { headers: { "CONVAI-API-KEY": apiKey, "Content-Type": "application/json" }, timeout: 45000 }
-      );
-      convaiText = r?.data?.response ?? null;
-      audioBase64 = r?.data?.audio_base64 || r?.data?.audio || null;
-    } catch (e) {
-      // (Optional) You could add a multipart fallback here if needed
-    }
+    let audioBase64 = base64 || null;
 
     if (!audioBase64) {
-      return res.status(502).json({ error: "Convai returned no audio." });
+      if (!text || !text.trim()) {
+        return res.status(400).json({ error: "Missing 'text' or 'base64' in body." });
+      }
+
+      const apiKey = process.env.CONVAI_API_KEY;
+      const charId = process.env.CHARACTER_ID;
+      if (!apiKey || !charId) {
+        return res.status(500).json({ error: "Server misconfigured: missing CONVAI_API_KEY or CHARACTER_ID." });
+      }
+
+      // First try JSON body
+      try {
+        const resp = await axios.post(
+          "https://api.convai.com/character/getResponse",
+          {
+            userText: text,
+            charID: charId,
+            sessionID: "-1",
+            voiceResponse: true
+          },
+          {
+            headers: {
+              "CONVAI-API-KEY": apiKey,
+              "Content-Type": "application/json"
+            },
+            timeout: 45000
+          }
+        );
+        convaiText = resp?.data?.response ?? null;
+        audioBase64 = resp?.data?.audio_base64 || resp?.data?.audio || null;
+      } catch (jsonErr) {
+        // Retry with multipart/form-data
+        const fd = new FormData();
+        fd.append("userText", text);
+        fd.append("charID", charId);
+        fd.append("sessionID", "-1");
+        fd.append("voiceResponse", "true");
+
+        const resp2 = await axios.post(
+          "https://api.convai.com/character/getResponse",
+          fd,
+          {
+            headers: {
+              ...fd.getHeaders(),
+              "CONVAI-API-KEY": apiKey
+            },
+            timeout: 45000
+          }
+        );
+        convaiText = resp2?.data?.response ?? null;
+        audioBase64 = resp2?.data?.audio_base64 || resp2?.data?.audio || null;
+      }
+
+      if (!audioBase64) {
+        return res.status(502).json({ error: "Convai returned no audio in response." });
+      }
     }
 
-    fs.writeFileSync(OUTPUT_MP3, Buffer.from(audioBase64, "base64"));
-    return res.json({ success: true, text: convaiText, url: "/output.mp3" });
+    // Save as WAV
+    const buf = Buffer.from(audioBase64, "base64");
+    fs.writeFileSync(AUDIO_FILE, buf);
+
+    return res.json({
+      success: true,
+      text: convaiText,
+      url: "/output.wav"
+    });
   } catch (err) {
-    console.error("updateText error:", err?.response?.data || err.message || err);
-    return res.status(500).json({ error: err?.response?.data || err.message || "unknown error" });
+    console.error("updateText error:", err?.response?.data || err.message);
+    return res.status(500).json({ error: err?.response?.data || err.message });
   }
 });
 
-/* -----------------------------------------
-   NEW: Discord-only endpoint (safe & additive)
-   -----------------------------------------
-   POST /discordSay
-   Body: { text: "hello" }
-   Calls Convai itself and writes public/output.mp3.
-   Does NOT change SL behavior.
-*/
-app.post("/discordSay", async (req, res) => {
-  try {
-    const text = (req.body?.text || "").trim();
-    if (!text) return res.status(400).json({ error: "Missing 'text'." });
+// Serve static files (including /output.wav)
+app.use(express.static("public"));
 
-    const apiKey = process.env.CONVAI_API_KEY;
-    const charId = process.env.CONVAI_CHAR_ID || process.env.CHARACTER_ID;
-    if (!apiKey || !charId) {
-      return res.status(500).json({ error: "Missing CONVAI_API_KEY or CONVAI_CHAR_ID/CHARACTER_ID." });
-    }
-
-    let convaiText = null;
-    let audioBase64 = null;
-
-    // JSON request to Convai
-    const r = await axios.post(
-      "https://api.convai.com/character/getResponse",
-      { userText: text, charID: charId, sessionID: "-1", voiceResponse: true },
-      { headers: { "CONVAI-API-KEY": apiKey, "Content-Type": "application/json" }, timeout: 45000 }
-    );
-    convaiText = r?.data?.response ?? null;
-    audioBase64 = r?.data?.audio_base64 || r?.data?.audio || null;
-
-    if (!audioBase64) {
-      return res.status(502).json({ error: "Convai returned no audio." });
-    }
-
-    fs.writeFileSync(OUTPUT_MP3, Buffer.from(audioBase64, "base64"));
-    return res.json({ success: true, text: convaiText, url: "/output.mp3" });
-  } catch (err) {
-    console.error("discordSay error:", err?.response?.data || err.message || err);
-    return res.status(500).json({ error: err?.response?.data || err.message || "unknown error" });
+// If the file isn't there yet, show a friendly message rather than a generic 404
+app.get("/output.wav", (req, res, next) => {
+  if (!fs.existsSync(AUDIO_FILE)) {
+    return res.status(404).send("No audio saved yet. POST text or base64 to /updateText first.");
   }
-});
-
-// Optional aliases so your bot can GET either path
-app.get("/output.wav", (req, res) => {
-  if (!fs.existsSync(OUTPUT_MP3)) return res.status(404).send("Audio not ready yet.");
-  res.sendFile(OUTPUT_MP3);
-});
-app.get("/output", (req, res) => {
-  if (!fs.existsSync(OUTPUT_MP3)) return res.status(404).send("Audio not ready yet.");
-  res.sendFile(OUTPUT_MP3);
+  return res.sendFile(AUDIO_FILE);
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Convai server listening on port ${PORT}`);
-  console.log("Public dir:", PUBLIC_DIR);
-  console.log("Output file:", OUTPUT_MP3);
+  console.log(`Convai WAV server running on port ${PORT}`);
 });
