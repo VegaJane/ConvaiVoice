@@ -106,16 +106,33 @@ app.post("/updateText", async (req, res) => {
   }
 });
 
-// Serve static files (including /output.wav)
-app.use(express.static("public"));
-
-// If the file isn't there yet, show a friendly message rather than a generic 404
-app.get("/output.wav", (req, res, next) => {
+/**
+ * Raw WAV endpoint for bots (Discord, SL, etc.)
+ * Always returns only the binary WAV, never HTML.
+ */
+app.get("/output.wav", (req, res) => {
   if (!fs.existsSync(AUDIO_FILE)) {
-    return res.status(404).send("No audio saved yet. POST text or base64 to /updateText first.");
+    return res
+      .status(404)
+      .send("No audio saved yet. POST text or base64 to /updateText first.");
   }
-  return res.sendFile(AUDIO_FILE);
+
+  res.setHeader("Content-Type", "audio/wav");
+  res.setHeader("Content-Disposition", "inline; filename=output.wav");
+
+  const stream = fs.createReadStream(AUDIO_FILE);
+  stream.on("error", (err) => {
+    console.error("Error streaming output.wav:", err);
+    if (!res.headersSent) {
+      res.status(500).send("Error reading audio file.");
+    }
+  });
+
+  stream.pipe(res);
 });
+
+// Serve any other static files in /public (HTML, JS, etc.)
+app.use(express.static(PUBLIC_DIR));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
