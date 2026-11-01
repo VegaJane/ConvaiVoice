@@ -1,3 +1,4 @@
+import { installSnapshots } from "./snapshot-relay.js";
 import { installSageRelay } from "./sage-relay.js";
 import express from "express";
 import bodyParser from "body-parser";
@@ -9,6 +10,7 @@ import FormData from "form-data";
 const app = express();
 app.use(bodyParser.json({ limit: "50mb" }));
 installSageRelay(app);
+installSnapshots(app);
 
 // Ensure public directory exists
 const PUBLIC_DIR = path.join(process.cwd(), "public");
